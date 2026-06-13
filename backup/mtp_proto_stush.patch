@@ -1,0 +1,233 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index b6a7626f2..e5b3b84a8 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1589,6 +1589,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.type_k = params.cache_type_k;
+     cparams.type_v = params.cache_type_v;
+ 
++    if (params.speculative.has_dft()) {
++        cparams.src_ctx = params.speculative.draft.src_ctx;
++    }
++
+     return cparams;
+ }
+ 
+diff --git a/common/common.h b/common/common.h
+index 13f387271..5921e21d1 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -1,12 +1,8 @@
+ // Various helper functions and utilities
+-
+ #pragma once
+ 
+ #include "llama-cpp.h"
+ 
+-#include "ggml-opt.h"
+-#include "ggml.h"
+-
+ #include <set>
+ #include <sstream>
+ #include <string>
+@@ -15,10 +11,13 @@
+ #include <map>
+ #include <algorithm>
+ 
++struct llama_context;
++
+ #if defined(_WIN32) && !defined(_WIN32_WINNT)
+ #define _WIN32_WINNT 0x0A00
+ #endif
+ 
++
+ #ifdef _WIN32
+ #define DIRECTORY_SEPARATOR '\\'
+ #else
+@@ -312,11 +311,12 @@ struct common_params_speculative_draft {
+ 
+     llama_context * ctx_tgt = nullptr;
+     llama_context * ctx_dft = nullptr;
++    llama_context * src_ctx = nullptr;
+ 
+     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
+ 
+-    ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
+-    ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
++    ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for K
++    ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for V
+ 
+     common_cpu_params cpuparams;
+     common_cpu_params cpuparams_batch;
+@@ -326,6 +326,7 @@ struct common_params_speculative_draft {
+     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+ };
+ 
++
+ struct common_params_speculative_ngram_mod {
+     int32_t n_match = 24;
+ 
+diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
+index 5e0e22c7f..764f19266 100644
+--- a/ggml/src/ggml-cuda/vendors/hip.h
++++ b/ggml/src/ggml-cuda/vendors/hip.h
+@@ -249,7 +249,7 @@ typedef __hip_bfloat162 nv_bfloat162;
+ 
+ #if HIP_VERSION >= 60200000
+ #include <hip/hip_fp8.h>
+-typedef __hip_fp8_e4m3 __nv_fp8_e4m3;
++// typedef __hip_fp8_e4m3 __nv_fp8_e4m3;
+ #define FP8_AVAILABLE
+ #endif // HIP_VERSION >= 60200000
+ 
+diff --git a/include/llama.h b/include/llama.h
+index 9f78aa9a0..ebddf3de7 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -383,11 +383,13 @@ extern "C" {
+                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
+                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+ 
+-        // [EXPERIMENTAL]
+-        // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
+-        // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
+-        struct llama_sampler_seq_config * samplers;
+-        size_t                            n_samplers;
++    // [EXPERIMENTAL]
++    // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
++    // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
++    struct llama_sampler_seq_config * samplers;
++    size_t                            n_samplers;
++    struct llama_context *            src_ctx; // source context for MTP draft
++
+     };
+ 
+     struct llama_model_tensor_override {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 5daa80cfe..ca885b7b1 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3485,8 +3485,9 @@ llama_context_params llama_context_default_params() {
+         /*.op_offload                  =*/ true,
+         /*.swa_full                    =*/ true,
+         /*.kv_unified                  =*/ false,
+-        /*.sampler                     =*/ nullptr,
+-        /*.n_sampler                   =*/ 0,
++        /*.samplers                    =*/ nullptr,
++        /*.n_samplers                  =*/ 0,
++        /*.src_ctx                     =*/ nullptr,
+     };
+ 
+     return result;
+diff --git a/tools/cli/cli.cpp b/tools/cli/cli.cpp
+index af40adbb4..8f2aced21 100644
+--- a/tools/cli/cli.cpp
++++ b/tools/cli/cli.cpp
+@@ -397,6 +397,13 @@ int llama_cli(int argc, char ** argv) {
+         return 1;
+     }
+ 
++    if (params.speculative.has_dft()) {
++        printf("[DEBUG] params.speculative.has_dft() is true. Calling link_mtp_source()...\n");
++        ctx_cli.ctx_server.link_mtp_source();
++    } else {
++        printf("[DEBUG] params.speculative.has_dft() is false!\n");
++    }
++
+     console::spinner::stop();
+     console::log("\n");
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 80119c8c8..17157e4a0 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -10,6 +10,8 @@
+ #include "common.h"
+ #include "fit.h"
+ #include "llama.h"
++#include "../../src/llama-model.h"
++#include "../../src/llama-arch.h"
+ #include "../../src/llama-ext.h" // staging API: llama_set_mtp_source
+ #include "ggml-cpp.h"
+ #include "log.h"
+@@ -47,15 +49,13 @@ static uint32_t server_n_outputs_max(const common_params & params) {
+         return n_batch;
+     }
+ 
+-    const uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
+-
+-    const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
+-
+-    return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
++    return 1;
+ }
+ 
++
+ // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
+ enum slot_state {
++
+     SLOT_STATE_IDLE,
+     SLOT_STATE_WAIT_OTHER, // after assigning a task, but waiting for parent slot to process prompt
+     SLOT_STATE_STARTED,    // after assigning a task and about to process prompt
+@@ -648,6 +648,8 @@ public:
+     //  - and, with thread-safe APIs (e.g., tokenizer calls)
+     llama_model * model_tgt = nullptr;
+ 
++    void link_mtp_source();
++
+     mtmd_context * mctx = nullptr;
+     const llama_vocab * vocab = nullptr;
+ 
+@@ -965,7 +967,7 @@ private:
+ 
+             auto cparams = common_context_params_to_llama(params_dft);
+ 
+-            if (spec_mtp) {
++            if (spec_mtp || (model_dft && model_dft->arch == LLM_ARCH_GEMMA4_ASSISTANT)) {
+                 cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+             }
+ 
+@@ -3568,6 +3570,17 @@ private:
+     }
+ };
+ 
++void server_context_impl::link_mtp_source() {
++    printf("[DEBUG] server_context_impl::link_mtp_source() called. ctx_dft: %p, ctx_tgt: %p\n", (void*)ctx_dft.get(), (void*)ctx_tgt);
++    if (ctx_dft && ctx_tgt) {
++        llama_set_mtp_source(ctx_dft.get(), ctx_tgt);
++        printf("[DEBUG] llama_set_mtp_source() called successfully.\n");
++    } else {
++        printf("[DEBUG] link_mtp_source() FAILED: one of the contexts is null.\n");
++    }
++}
++
++
+ //
+ // server_context (public API)
+ //
+@@ -3588,6 +3601,10 @@ void server_context::terminate() {
+     impl->queue_tasks.terminate();
+ }
+ 
++void server_context::link_mtp_source() {
++    impl->link_mtp_source();
++}
++
+ llama_context * server_context::get_llama_context() const {
+     return impl->ctx_tgt;
+ }
+diff --git a/tools/server/server-context.h b/tools/server/server-context.h
+index 73caff54a..ac40eb3cf 100644
+--- a/tools/server/server-context.h
++++ b/tools/server/server-context.h
+@@ -72,6 +72,10 @@ struct server_context {
+     // not thread-safe, should only be used from the main thread
+     llama_context * get_llama_context() const;
+ 
++    // link draft and target contexts for MTP
++    // not thread-safe, should only be used from the main thread
++    void link_mtp_source();
++
+     // get a new response reader, used by CLI application
+     server_response_reader get_response_reader();
+ 
